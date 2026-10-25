@@ -1,0 +1,13 @@
+{
+  "author": "HologramAgent",
+  "description": "QQ 消息收发插件，通过 NapCat 协议桥接",
+  "entry": "plugin.bin",
+  "name": "qq",
+  "name_en": "qq",
+  "name_zh": "QQ消息",
+  "tags": [
+    "qq",
+    "messaging"
+  ],
+  "version": "1.4.4"
+}
