@@ -12,6 +12,7 @@ import (
 	"io"
 	"log"
 	"math"
+	"math/rand"
 	"net"
 	"net/http"
 	"os"
@@ -241,10 +242,16 @@ type Plugin struct {
 
 	// 权限门策略（均可配置）。字段用**反向**命名，让零值 = 旧行为（严格）：
 	// 单测/未初始化时不至于把门悄悄放开 —— 这是安全默认。
-	groupRequireAtOff     bool     // true = 群里不 @ 也响应
+	groupRequireAtOff bool // true = 群里不 @ 也响应
+	// replyChance 是**未 @ 机器人**的群消息被注入的概率（0~100）。
+	//
+	// 语义（2026-10-27 用户口径）：
+	//   · 消息 @ 了机器人 → **100%** 注入（确定性，不看概率）
+	//   · 未 @ 的群消息   → 按本概率随机注入（0=从不，100=全量）
+	// 与 group_require_at 的关系：该开关仍是总闸（false 时不做概率，全部注入）。
+	replyChance           int
 	hardPrivateTools      []string // 非所有者即使白名单也拦的工具（精确名 / 前缀*）
 	hardPrivateToolsSet   bool     // 是否显式配置过（未配置 ⇒ 用内置默认清单）
-	sessionScopeUnlimited bool     // true = 非所有者可跨会话读
 
 	// msg_id → peer 映射 + 会话最新状态（<7 天兜底 get_history + list_chats）
 	msgMu  sync.Mutex
@@ -435,6 +442,18 @@ func (p *Plugin) Start(s *sdk.PluginSDK) error {
 	// 默认关的理由：它对外可见（好友会看到状态在跳），属于
 	// "内核替用户做决定"——与 offload 同一类，必须显式打开。
 	s.Settings().RegisterDef(sdk.ConfigDef{Key: "status_auto", Default: "false", Type: "bool", DisplayName: "随阶段切在线状态", Description: "开启后：调工具时切「搬砖中」、生成回复时切「学习中」、一轮结束切回「在线」。失败不影响工具调用", Category: "qq"})
+	// turn_hints：**本轮注入的行为提示**（可选，空 = 不加）。
+	//
+	// 为什么放在插件而不是内核/人格：只有插件同时知道"这是 QQ、私聊还是群、
+	// 对方是不是 owner、群里要不要 @、有没有收藏表情"。这些是**本轮事实**，
+	// 人格只描述"我是谁"，说不清"这一轮能做什么"。
+	//
+	// 现场（2026-10-26）：注入文本只教"怎么取消息、往哪回"，于是模型
+	// 不知道可以发表情、不知道群里要 @，风格全押在 skill 上 —— 而 skill
+	// 需要模型主动去读，它经常不读。
+	s.Settings().RegisterDef(sdk.ConfigDef{Key: "turn_hints", Default: "", Type: "text",
+		DisplayName: "本轮行为提示（注入给模型，可留空）",
+		Description: "每条消息注入时附带的行为提示。留空则不加。", Category: "qq"})
 	s.Settings().RegisterDef(sdk.ConfigDef{Key: "sticker_descs", Default: "", Type: "text", DisplayName: "表情包描述缓存",
 		Description: "收藏表情的内容/情绪描述（JSON，url → {desc,mood}）。由 qq_describe_sticker 自动写入，一般不用手改；清空后 loss 描述，表情仍可发。", Category: "qq"})
 	s.Settings().RegisterDef(sdk.ConfigDef{Key: "owner", Default: "", Type: "string", DisplayName: "Bot 所有者 QQ", Description: "Bot 所有者 QQ 号列表，逗号分隔。所有者无论私聊或群聊均拥有完整工具权限", Category: "qq"})
@@ -446,19 +465,21 @@ func (p *Plugin) Start(s *sdk.PluginSDK) error {
 	s.Settings().RegisterDef(sdk.ConfigDef{Key: "max_duplicate_qq_send", Default: defaultMaxDuplicateSend, Type: "int", DisplayName: "单轮相同 QQ 发送上限", Description: "单轮内参数完全相同的 output_send__qq 允许重复的次数（0=不限制）；这才是循环保险的真正触发条件", Category: "qq"})
 	s.Settings().RegisterDef(sdk.ConfigDef{Key: "dm_policy", Default: "open", Type: "string", DisplayName: "私聊策略", Description: "open / allowlist / disabled", Category: "qq", Options: []string{"open", "allowlist", "disabled"}})
 	s.Settings().RegisterDef(sdk.ConfigDef{Key: "allow_from", Default: "", Type: "string", DisplayName: "私聊白名单", Description: "允许私聊机器人的 QQ 号列表，逗号分隔", Category: "qq"})
+	s.Settings().RegisterDef(sdk.ConfigDef{Key: "group_reply_chance", Default: "0", Type: "int",
+		DisplayName: "未 @ 时的回复概率（%）",
+		Description: "0~100。群里**没有 @ 机器人**的消息按此概率随机响应；@ 了机器人则 100% 响应（不受此项影响）。0=只在被 @ 时回复，100=群里每条都回。",
+		Category:    "qq"})
 	s.Settings().RegisterDef(sdk.ConfigDef{Key: "group_require_at", Default: "true", Type: "bool", DisplayName: "群聊必须 @ 才响应",
 		Description: "true=群里只有 @ 机器人才回应（默认，避免乱插话）；false=群里所有消息都回应。群多、想让机器人自然搭话时关闭", Category: "qq"})
 	s.Settings().RegisterDef(sdk.ConfigDef{Key: "hard_private_tools", Default: defaultHardPrivateTools, Type: "string", DisplayName: "硬性私人工具限制",
 		Description: "JSON 数组：非所有者即使白名单放行也会被拦的工具，支持精确名与尾部 * 前缀（如 files_*）。清空 [] = 不做硬性拦截，完全交给白名单", Category: "qq"})
-	s.Settings().RegisterDef(sdk.ConfigDef{Key: "session_scope_enforce", Default: "true", Type: "bool", DisplayName: "非所有者只能读当前会话",
-		Description: "true=非所有者只能读本会话消息（默认，防跨会话翻别人聊天记录）；false=允许按会话 ID 读其它会话", Category: "qq"})
 	s.Settings().RegisterDef(sdk.ConfigDef{Key: "group_policy", Default: "open", Type: "string", DisplayName: "群聊策略", Description: "open / allowlist / disabled", Category: "qq", Options: []string{"open", "allowlist", "disabled"}})
 	s.Settings().RegisterDef(sdk.ConfigDef{Key: "group_allow_from", Default: "", Type: "string", DisplayName: "群聊白名单", Description: "允许接入的群号列表，逗号分隔", Category: "qq"})
 	s.Settings().RegisterDef(sdk.ConfigDef{Key: "forward_rules", Default: "[]", Type: "string", DisplayName: "转发规则", Description: "JSON 数组，每项 {group_id,host,port,password,template}。匹配的群消息通过 RCON 转发到 Minecraft。template 支持 {nickname} {message} 占位", Category: "qq"})
-	s.Settings().RegisterDef(sdk.ConfigDef{Key: "files_dir", Default: "/home/newqqagent/agentfs/merged/qq_files", Type: "string", DisplayName: "文件存储目录", Description: "从QQ接收的文件保存目录（CQ file/image 自动下载到此目录）", Category: "qq"})
+	s.Settings().RegisterDef(sdk.ConfigDef{Key: "files_dir", Default: "/home/hologramagent/qq-workspace/files", Type: "string", DisplayName: "文件存储目录", Description: "从QQ接收的文件保存目录（CQ file/image 自动下载到此目录）", Category: "qq"})
 	s.Settings().RegisterDef(sdk.ConfigDef{Key: "remote_dir", Default: "/home/program/qq-workspace/remote", Type: "string", DisplayName: "NapCat容器共享目录", Description: "与NapCat容器共享的文件目录，主机路径。发文件时文件会复制到此目录，NapCat内部映射为/app/files/", Category: "qq"})
 	s.Settings().RegisterDef(sdk.ConfigDef{Key: "webhook_token", Default: "", Type: "string", DisplayName: "Webhook 令牌", Description: "NapCat 上报请求头 X-Webhook-Token 校验值，留空则不校验", Category: "qq"})
-	s.Settings().RegisterDef(sdk.ConfigDef{Key: "agentfs_dir", Default: "/home/newqqagent/agentfs/merged", Type: "string", DisplayName: "AgentFS目录", Description: "文件读写的工作目录，read_document/video_download 等工具的默认工作目录", Category: "qq"})
+	s.Settings().RegisterDef(sdk.ConfigDef{Key: "agentfs_dir", Default: "/home/hologramagent/qq-workspace", Type: "string", DisplayName: "AgentFS目录", Description: "文件读写的工作目录，read_document/video_download 等工具的默认工作目录", Category: "qq"})
 	s.Settings().RegisterDef(sdk.ConfigDef{Key: "batch_window_ms", Default: "1500", Type: "int", DisplayName: "消息合并窗口(毫秒)", Description: "同一会话同一发送者的连续消息在该窗口内合并成一次中断并告知共几条；0=关闭合并（逐条投递）", Category: "qq"})
 	s.Settings().RegisterDef(sdk.ConfigDef{Key: "batch_max_ms", Default: "30000", Type: "int", DisplayName: "消息合并上限(毫秒)", Description: "一批消息最长等这么久就投递，避免对方持续刷屏时一直不唤醒 Agent", Category: "qq"})
 
@@ -484,9 +505,27 @@ func (p *Plugin) Start(s *sdk.PluginSDK) error {
 	p.groupToolAllowlists = parseGroupToolAllowlists(getSetting[string](settings, "group_tool_allowlists", defaultGroupToolAllowlists))
 	p.privateToolAllowlist = parseToolAllowlist(getSetting[string](settings, "private_tool_allowlist", defaultPublicToolAllowlist))
 	p.groupRequireAtOff = !strings.EqualFold(getSetting[string](settings, "group_require_at", "true"), "true")
+	// 未 @ 时的回复概率：越界值夹到 0..100，非法值回落 0 并留日志
+	//（静默当成 100 会让机器人突然开始刷群，那是灾难性误配置）。
+	{
+		raw := strings.TrimSpace(getSetting[string](settings, "group_reply_chance", "0"))
+		n, err := strconv.Atoi(raw)
+		if err != nil {
+			if raw != "" {
+				log.Printf("[qq] group_reply_chance %q 非法，按 0 处理", raw)
+			}
+			n = 0
+		}
+		if n < 0 {
+			n = 0
+		}
+		if n > 100 {
+			n = 100
+		}
+		p.replyChance = n
+	}
 	p.hardPrivateTools = parseToolAllowlist(getSetting[string](settings, "hard_private_tools", defaultHardPrivateTools))
 	p.hardPrivateToolsSet = true
-	p.sessionScopeUnlimited = !strings.EqualFold(getSetting[string](settings, "session_scope_enforce", "true"), "true")
 	p.maxQQToolCalls = nonNegativeOrDefault(int(getSetting[int64](settings, "max_qq_tool_calls", int64(defaultMaxQQToolCalls))), defaultMaxQQToolCalls)
 	p.maxQQOutputCalls = nonNegativeOrDefault(int(getSetting[int64](settings, "max_qq_output_calls", int64(defaultMaxQQOutputCalls))), defaultMaxQQOutputCalls)
 	p.maxDuplicateSend = nonNegativeOrDefault(int(getSetting[int64](settings, "max_duplicate_qq_send", int64(defaultMaxDuplicateSend))), defaultMaxDuplicateSend)
@@ -494,8 +533,8 @@ func (p *Plugin) Start(s *sdk.PluginSDK) error {
 	p.groupPolicy = normalizePolicy(getSetting[string](settings, "group_policy", "open"))
 	p.allowFrom = parseIDSet(getSetting[string](settings, "allow_from", ""))
 	p.groupAllowFrom = parseIDSet(getSetting[string](settings, "group_allow_from", ""))
-	p.filesDir = strings.TrimRight(getSetting[string](settings, "files_dir", "/home/newqqagent/agentfs/merged/qq_files"), "/")
-	p.agentfsDir = strings.TrimRight(getSetting[string](settings, "agentfs_dir", "/home/newqqagent/agentfs/merged"), "/")
+	p.filesDir = strings.TrimRight(getSetting[string](settings, "files_dir", "/home/hologramagent/qq-workspace/files"), "/")
+	p.agentfsDir = strings.TrimRight(getSetting[string](settings, "agentfs_dir", "/home/hologramagent/qq-workspace"), "/")
 	p.remoteDir = strings.TrimRight(getSetting[string](settings, "remote_dir", "/home/program/qq-workspace/remote"), "/")
 	p.batchWindow = time.Duration(getSetting[int64](settings, "batch_window_ms", 1500)) * time.Millisecond
 	p.batchMax = time.Duration(getSetting[int64](settings, "batch_max_ms", 30000)) * time.Millisecond
@@ -504,6 +543,12 @@ func (p *Plugin) Start(s *sdk.PluginSDK) error {
 	}
 	os.MkdirAll(p.remoteDir, 0755)
 	p.loadStickerDescs()
+
+	// ★ 声明安全档位（必须在 hard_private_tools 读入之后）。
+	//
+	// 声明是**同步**的：DeclareProfiles 返回即表示内核已登记，
+	// 之后注入带 qq.guest 才不会报"未声明档位"。
+	p.declareSecurityProfiles(s)
 
 	p.httpClient = &http.Client{Timeout: 30 * time.Second}
 
@@ -1309,68 +1354,6 @@ func argPeerID(args map[string]interface{}, key string) (int64, bool) {
 	return argInt64(args, key)
 }
 
-func (p *Plugin) sessionToolArgsAllowed(name string, args map[string]interface{}, auth qqAuthContext) (bool, string) {
-	if !auth.Active || auth.Owner {
-		return true, ""
-	}
-	// 可配置：session_scope_enforce=false 时不限制读取的会话范围
-	if p.sessionScopeUnlimited {
-		return true, ""
-	}
-	// 输出工具**不受"当前会话"身份限制**（先于身份判据返回）。
-	//
-	// 为什么：输出是 agent 的**主动调用**，发到哪个会话由它自己给的 meta
-	// （group_id / user_id）决定 —— handleChannelOutput 会强制要求该字段存在，
-	// 缺了会得到明确的报错。这里再要求"本轮能精确匹配可信 OneBot 事件"是多余的门，
-	// 而且会把合法发送一起拒掉：现场（被子的中断唤醒的一轮）父带齐 meta 也发不出去，
-	// 报「可信 QQ 会话身份不完整」。
-	// 「只能访问当前会话」这类限制只对**读取类**工具（get_history / mark_read /
-	// get_message）成立 —— 那才是真的不能跨会话读。
-	if name == "output_send__"+p.name {
-		return true, ""
-	}
-
-	currentPeer := auth.UserID
-	if auth.IsGroup {
-		currentPeer = auth.GroupID
-	}
-	if currentPeer == 0 {
-		return false, "可信 QQ 会话身份不完整"
-	}
-	matchCurrentPeer := func() bool {
-		groupID, hasGroup := argInt64(args, "group_id")
-		userID, hasUser := argInt64(args, "user_id")
-		if auth.IsGroup {
-			return hasGroup && groupID == auth.GroupID && !hasUser
-		}
-		return hasUser && userID == auth.UserID && !hasGroup
-	}
-
-	switch name {
-	case p.name + "_get_history", p.name + "_mark_read":
-		if !matchCurrentPeer() {
-			return false, "只能访问当前 QQ 会话"
-		}
-	case p.name + "_get_message":
-		messageID, ok := argInt64(args, "message_id")
-		if !ok {
-			return false, "缺少有效 message_id"
-		}
-		if messageID == auth.MessageID {
-			return true, ""
-		}
-		peerID, isGroup, _, found := p.lookupMsgRef(messageID)
-		if !found || isGroup != auth.IsGroup || peerID != currentPeer {
-			return false, "message_id 不属于当前 QQ 会话"
-		}
-	case p.name + "_get_group_member_info", p.name + "_get_group_files":
-		groupID, ok := argInt64(args, "group_id")
-		if !auth.IsGroup || !ok || groupID != auth.GroupID {
-			return false, "只能访问当前 QQ 群的数据"
-		}
-	}
-	return true, ""
-}
 
 // qqAuthExtraKey 是本轮（帧）QQ 身份挂在 StageContext.Extra 上的键。
 //
@@ -1614,11 +1597,22 @@ func isInternalToolCall(ctx *sdk.StageContext) bool {
 // 注：如果将来确实要支持“@全体就响应”，应做成显式配置项
 // （默认关闭），而不是藏在 @ 判定里默认生效。
 func (p *Plugin) isAtBot(msg interface{}) bool {
+	botIDStr := strconv.FormatInt(p.botID, 10)
+
+	// ★ NapCat 的 `message` 字段有**两种形态**（2026-10-26 现场）：
+	//   · 分段数组：[{type:"at",data:{qq:"1456128421"}}, …]   （message_post_format=array）
+	//   · CQ 码文本："[CQ:at,qq=1456128421] 你说啥"           （message_post_format=string）
+	//
+	// 原实现只认数组 ⇒ 本机部署（string 形态）下**永远返回 false**，
+	// 表现为"在群里 @ 她完全没反应"，而日志只打 not @bot，看不出是形态问题。
+	if str, ok := msg.(string); ok {
+		return strings.Contains(str, "[CQ:at,qq="+botIDStr+"]")
+	}
+
 	segments, ok := msg.([]interface{})
 	if !ok {
 		return false
 	}
-	botIDStr := strconv.FormatInt(p.botID, 10)
 	for _, seg := range segments {
 		s, ok := seg.(map[string]interface{})
 		if !ok {
@@ -1824,11 +1818,30 @@ func (p *Plugin) beforeToolcall(ctx *sdk.StageContext) error {
 		p.setDenial(ctx, msg)
 		return nil
 	}
-	if argsAllowed, reason := p.sessionToolArgsAllowed(tc.Name, tc.Arguments, auth); !argsAllowed {
-		msg := fmt.Sprintf("QQ 权限策略拒绝工具 %s：%s；请不要改用其他会话 ID 重试", tc.Name, reason)
-		p.setDenial(ctx, msg)
-		return nil
-	}
+	// ★ 已移除「只能读当前会话」的参数级限制（2026-10-29，用户裁定）。
+	//
+	// ## 改的是什么
+	//
+	// 原先 `sessionToolArgsAllowed` 会检查 qq_get_history / mark_read /
+	// get_message / get_group_member_info / get_group_files 的参数里
+	// 的 group_id / user_id 是否等于**本轮消息所在的那个会话**。
+	//
+	// ## 为何移除
+	//
+	// 用户明确：**允许访问所有会话**。
+	//
+	// 从架构上看它也放错了地方：这是「参数自证」——判据依赖
+	// **本轮消息来自哪个会话** + 本次调用的 args，而档位（Profile）的
+	// 判定接口是 `CheckTool(name)`，**看不到 args**。
+	// 把它塞进档位等于把「一次请求的上下文」塞进「长期策略表」，
+	// 语义不相容。所以它选择删掉而不是迁移。
+	//
+	// ## 保留的安全边界
+	//
+	// 以下仍然生效（不依赖本轮的会话身份）：
+	//   · 档位：qq.guest 的 DenyTools 清单（私人资源工具）—— 内核执行
+	//   · beforeToolcall：群/私聊工具白名单 currentToolAllowed
+	//   · 循环保险：单轮工具调用次数 / 重复发送上限
 	if tc.Name == p.name+"_group_manage" {
 		cmd, _ := tc.Arguments["command"].(string)
 		if requiresConfirmGroupCommand(cmd) {
@@ -1878,7 +1891,7 @@ func (p *Plugin) enqueueInterrupt(msgType string, userID, groupID, messageID int
 		return
 	}
 	if p.batchWindow <= 0 {
-		p.injectInterrupt(single, p.interruptLevel(owner), qqInjectPayload(userID, groupID, msgType == "group"))
+		p.injectInterrupt(single, p.interruptLevel(owner), qqInjectPayload(userID, groupID, msgType == "group"), owner)
 		return
 	}
 	key := qqBatchKey(msgType, groupID, userID)
@@ -1914,20 +1927,107 @@ func (p *Plugin) enqueueInterrupt(msgType string, userID, groupID, messageID int
 	p.batchMu.Unlock()
 }
 
-// interruptLevel 决定一条 QQ 消息的中断级别。
+// interruptLevel 决定一条 QQ 消息的中断级别（2026-10-27 用户裁定改级）。
 //
-//   - Bot 所有者/管理员的消息 → **L2**（一般提醒）；
-//   - 其他人的消息 → L1（后台，完全可等）。
+//   - Bot 所有者/管理员 → **L3**（需及时处理）
+//   - 普通用户         → **L2**（一般提醒）
 //
-// 为什么不能一律 L1：L1 之间可以随时互相抢占、也可以被任何更高一级打断，
-// 于是「老板发的话」会被路人的闲聊挤到后面，甚至对方持续刷屏时一直排在队尾。
-// 为什么也不该给 L3：L3 是时钟/终端那类"需要及时处理"的实时工作，QQ 是异步
-// 消息，抬到 L3 会反过来打断真正实时的事情。
+// 为什么不再用 L1：L1 是"完全可等"，且 L1 之间**同级不抢占**——
+// 主人发的话会被路人闲聊按到达顺序排在后面，持续刷屏时甚至一直排队尾。
+// QQ 是异步消息，但"主人叫它"必须比路人闲聊更早被接住。
+//
+// 为什么管理员只到 L3 而不是 L4：L4 是内核独占（panic/overflow/childfull），
+// 插件声明 L4 会被 clampPluginLevel 夹回 L3 —— 声明 L4 是无效的，不如直接声明 L3。
 func (p *Plugin) interruptLevel(owner bool) string {
 	if owner {
-		return sdk.PriorityL2
+		return sdk.PriorityL3
 	}
-	return sdk.PriorityL1
+	return sdk.PriorityL2
+}
+
+// ───────────────────── 安全策略：声明式（2026-10-29） ─────────────────────
+//
+// ## 改动前的形态（plan.md §六 记录的「反例」）
+//
+// 身份判定、用户白名单、硬私有工具、内部委派放行、群发限制
+// **全在 beforeToolcall 一个 stage handler 里**。后果：
+//
+//	· 每个插件各写一套判定，拒绝文案与语义分散
+//	· 插件崩了策略就没了（判定不在内核）
+//	· 同一份"硬私有清单"在 QQ 配置里、内核里各有一份口径
+//
+// ## 改动后的分工
+//
+//	QQ（本文件）  ：声明档位 + 注入时按身份选档     ← 只声明
+//	内核 security ：CheckTool / ActivateProfile      ← 只执行
+//
+// 档位**只能收窄**：内核判定顺序是「全局 deny → 档位 deny → 主体 deny
+// → 全局 allow → 档位 allow」，全局黑名单永远先判，档位绕不过去。
+//
+// ## 为什么 owner 也有档位
+//
+// 声明 `qq.owner` 而非"不传档位"，是为了**让行为显式**：所有者档位不额外
+// 限制（零 DenyTools），但它存在这件事本身可审计（日志里能看到本轮按哪档判定）。
+const (
+	// securityProfileOwner 是所有者档位：不额外收窄。
+	securityProfileOwner = "qq.owner"
+	// securityProfileGuest 是访客档位：叠加硬私有清单的收窄。
+	securityProfileGuest = "qq.guest"
+)
+
+// securityProfileFor 按发送者身份返回本轮档位名。
+//
+// ★ 这是**唯一**需要 QQ 关心的策略决定：「这条消息是谁发的」。
+// 其余的"哪些工具不许用"由内核按档位里声明的清单执行，
+// 不再散落在本插件的 stage handler 里。
+func (p *Plugin) securityProfileFor(owner bool) string {
+	if owner {
+		return securityProfileOwner
+	}
+	return securityProfileGuest
+}
+
+// declareSecurityProfiles 把两个档位登记到内核（Start 时调用一次）。
+//
+// ## 为什么访客档位用 DenyTools 而不是 AllowTools
+//
+// AllowTools 是"只有这些"的语义，而 QQ 的工具面会随插件安装变化
+// （用户装了 bili/music/weather… 访客也该能用）。用 DenyTools 表达
+// "禁止私人资源"更稳：新增的公开工具自动对访客开放，不会因为
+// 忘了加白名单而静默不可用 —— 后者是更难发现的故障。
+//
+// 拒绝清单取自 `hard_private_tools` 配置（保持运维可改），
+// 条目支持尾部 `*` 前缀。
+func (p *Plugin) declareSecurityProfiles(s *sdk.PluginSDK) {
+	sec := s.Security()
+	if sec == nil {
+		// 宿主未接声明面（旧内核/独立测试）：不失败。
+		// 此时 beforeToolcall 的自判逻辑仍在（见下方"双轨过渡"说明），
+		// 行为与改动前一致 —— 不会因为内核老就放开权限。
+		log.Printf("[qq] security declaration API unavailable; keeping legacy in-plugin checks")
+		return
+	}
+
+	deny := p.hardPrivateTools
+	if !p.hardPrivateToolsSet {
+		deny = defaultHardPrivateParsed
+	}
+
+	if err := sec.DeclareProfiles([]sdk.SecurityProfile{
+		// 所有者：不额外限制（空 DenyTools = 本档位不收窄）。
+		{Name: securityProfileOwner},
+		// 访客：硬私有清单在这里由**内核**执行。
+		{Name: securityProfileGuest, DenyTools: deny},
+	}); err != nil {
+		// 响亮但不断流：声明失败不该让插件起不来，但必须留痕 ——
+		// 否则权限门会静默退回"仅靠 beforeToolcall 自判"。
+		log.Printf("[qq] declare security profiles failed: %v", err)
+		return
+	}
+	// 成功也留痕：否则运维无法区分「声明生效」与「代码根本没跑到这里」。
+	// 这条日志是灰度期验证策略真的上线的唯一信号。
+	log.Printf("[qq] security profiles declared: %s (unrestricted), %s (deny %d patterns)",
+		securityProfileOwner, securityProfileGuest, len(deny))
 }
 
 // qqInjectPayload 构造注入的 payload 扩展：告诉内核“这一轮是哪个用户引起的”。
@@ -1956,7 +2056,12 @@ func qqInjectPayload(userID, groupID int64, isGroup bool) map[string]interface{}
 }
 
 // injectInterrupt 投递一条中断提示（NoMemory：HTTP 侧来的不是对话内容）。
-func (p *Plugin) injectInterrupt(text, level string, payload map[string]interface{}) {
+// injectInterrupt 投递一条中断输入。
+//
+// ★ owner 参数决定**本轮的安全档位**（声明式策略，2026-10-29）。
+// 非所有者带来的消息带 `qq.guest` 档位，内核据此收窄工具面；
+// 所有者带 `qq.owner`（= 不额外限制）。
+func (p *Plugin) injectInterrupt(text, level string, payload map[string]interface{}, owner bool) {
 	if text == "" {
 		return
 	}
@@ -1975,6 +2080,16 @@ func (p *Plugin) injectInterrupt(text, level string, payload map[string]interfac
 		Priority: level,
 		// 中断文本是路由/取正文的指令，不是对话内容，不据它召回。
 		RecallPolicy: sdk.RecallPolicyNone,
+		// ★ 策略**声明式**：按发送者身份选档位，由内核执行判定。
+		//
+		// 在此之前权限判定全在 beforeToolcall 里自己做（读配置、判身份、
+		// 查白名单、查硬私有）—— 那是 plan.md §六 记录的反例：每个插件
+		// 各写一套、拒绝语义散落、插件崩了策略就没了。
+		//
+		// 现在：QQ 只声明档位（Start 里的 DeclareProfiles），注入时带上
+		// 档位名，判定交给内核 security.CheckTool。档位只能**收窄**，
+		// 绕不过全局黑名单。
+		SecurityProfile: p.securityProfileFor(owner),
 		// 业务字段（身份）随 payload 走，内核原样透传到本轮 stageCtx.Extra。
 		Payload: payload,
 	})
@@ -1994,7 +2109,7 @@ func (p *Plugin) flushBatch(key string) {
 		text = p.buildBatchInterrupt(b)
 	}
 	// 一批里只要有一条来自 Bot 所有者，整批按 L2 投递（不因混入路人消息而降低）。
-	p.injectInterrupt(text, p.interruptLevel(b.owner), qqInjectPayload(b.userID, b.groupID, b.isGroup))
+	p.injectInterrupt(text, p.interruptLevel(b.owner), qqInjectPayload(b.userID, b.groupID, b.isGroup), b.owner)
 }
 
 // flushAllBatches 停机前把未到点的批次立刻投出去（best effort）。
@@ -2130,6 +2245,9 @@ func (p *Plugin) handleWebhook(w http.ResponseWriter, r *http.Request) {
 		p.snapshotMsg(evt.MessageID, peerID, isGroup, evt.Time, nickname, sum)
 	}
 
+	// isAt 记录"这条消息是否 @ 了 bot"：后面判断"空正文能不能丢"要用
+	//（纯 @ 是叫你一声，必须回；没 @ 且没正文才是真的可以不处理）。
+	isAt := false
 	if evt.MessageType == "group" {
 		// 群消息必须 @ 机器人才响应
 		if p.botID == 0 {
@@ -2137,13 +2255,20 @@ func (p *Plugin) handleWebhook(w http.ResponseWriter, r *http.Request) {
 			w.WriteHeader(http.StatusOK)
 			return
 		}
-		if !p.isAtBot(evt.Message) {
-			// 默认必须 @bot；group_require_at=false 时改为"群里所有消息都响应"
-			// （由部署者按群规模/使用习惯决定，而不是写死在代码里）。
-			if !p.groupRequireAtOff {
+		isAt = p.isAtBot(evt.Message)
+		if !isAt {
+			// @ 了机器人 → 100% 注入（确定性）；没 @ 时按概率。
+			//   · group_require_at=false  → 总闸关掉，全部注入（概率不起作用）
+			//   · group_reply_chance=N    → 未 @ 的消息以 N% 概率注入
+			if p.groupRequireAtOff {
+				// 总闸关掉：意图就是"全量"，不打日志免得刷屏
+			} else if p.replyChance > 0 && rand.Intn(100) < p.replyChance {
+				log.Printf("[qq] group msg from %d/%d injected by chance (chance=%d%%, raw=%.80s)",
+					evt.GroupID, evt.UserID, p.replyChance, rawCQ)
+			} else {
 				// 诊断：@ 解析失败时打印 at 段原文与 botID，定位漏报问题
-				log.Printf("[qq] group msg from %d/%d not @bot (botID=%d, raw=%.120s)",
-					evt.GroupID, evt.UserID, p.botID, rawCQ)
+				log.Printf("[qq] group msg from %d/%d not @bot (chance=%d%%, botID=%d, raw=%.120s)",
+					evt.GroupID, evt.UserID, p.replyChance, p.botID, rawCQ)
 				w.WriteHeader(http.StatusOK)
 				return
 			}
@@ -2161,14 +2286,33 @@ func (p *Plugin) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	if p.isOwner(evt.UserID) {
 		interrupt = "【重要！Bot 所有者消息】" + interrupt
 	}
+	// ★ 本轮行为提示（配置驱动，可留空）。
+	//
+	// 只加**这一轮确实成立**的事实，不写通用说教：
+	//   · 群聊且有 group_require_at ⇒ 必须 @，否则对方收不到提醒
+	//   · 有收藏表情 ⇒ 允许用 sticker（并说明一条一张、不混文字）
+	// 未被 @ 却被概率抽中 = 这是**随机插话**，模型必须知道，
+	// 否则会把别人的闲聊当成对它说的话而答非所问（2026-10-27）。
+	byChance := evt.MessageType == "group" && !isAt && !p.groupRequireAtOff
+	interrupt += p.turnHints(evt.MessageType, evt.GroupID, evt.UserID, byChance)
 
 	if text != "" {
 		text = stripCQRe.ReplaceAllString(text, "")
 		text = strings.TrimSpace(text)
 	}
+	// ★ 纯 @ 消息（`[CQ:at,qq=<bot>]` 后面没有正文）**不能丢**（2026-10-26 现场）。
+	//
+	// 原实现在这里 `return`：群里 @ 她一下就触发这条早退，用户看到的是
+	// "怎么 @ 她没反应"，而日志里连一条 not @bot 都没有 —— 因为 @ 已经通过了，
+	// 是正文为空被静默丢弃。@ 一下本身就是"叫你一声"，必须回。
 	if text == "" {
-		w.WriteHeader(http.StatusOK)
-		return
+		// 走到这里的群消息要么 @ 了机器人（100% 处理），要么已被概率抽中
+		//（上面的门已经放行）。仍在门外的（没 @ 且没抽中）更早就已经 return。
+		if !isAt && !p.groupRequireAtOff && p.replyChance == 0 {
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		text = "（这是一条没有正文的消息（纯图片/表情/纯 @）—— 自己判断是否回应）"
 	}
 	highRisk := false
 	if highRiskRe.MatchString(text) {
@@ -2609,10 +2753,33 @@ func (p *Plugin) handleChannelOutput(args map[string]interface{}) (interface{}, 
 		}
 
 	case "voice", "audio":
-		text := p.sensitiveFilter(payload)
-		audioFile, err := p.ttsToFile(text)
-		if err != nil {
-			return nil, fmt.Errorf("语音生成失败: %w", err)
+		// ★ payload 可以是**文本**（走插件 TTS），也可以是**已存在的音频文件**
+		// （本地路径或 file:// URL）。
+		//
+		// 为什么要支持后者（2026-10-26 用户需求）：外部 TTS/换声/唱歌服务
+		// （如肥鱼声库那种 HTTP 服务）产出的音频文件，本该直接发出去；
+		// 而此前 payload 一律被当成"待合成文本"，等于逼着每个音频都再过
+		// 一遍本插件内置的 TTS。
+		//
+		// 判定顺序：file:// 前缀 → 本地绝对路径存在 → 其余按文本合成。
+		// 不做"看起来像路径"的猜测：只有**确实存在**的文件才当文件。
+		audioFile := ""
+		if strings.HasPrefix(payload, "file://") {
+			audioFile = strings.TrimPrefix(payload, "file://")
+		} else if strings.HasPrefix(payload, "/") {
+			if _, statErr := os.Stat(payload); statErr == nil {
+				audioFile = payload
+			}
+		}
+		var err error
+		ttsTemp := false
+		if audioFile == "" {
+			text := p.sensitiveFilter(payload)
+			audioFile, err = p.ttsToFile(text)
+			if err != nil {
+				return nil, fmt.Errorf("语音生成失败: %w", err)
+			}
+			ttsTemp = true
 		}
 		os.MkdirAll(p.remoteDir, 0755)
 		dest := filepath.Join(p.remoteDir, filepath.Base(audioFile))
@@ -2623,7 +2790,11 @@ func (p *Plugin) handleChannelOutput(args map[string]interface{}) (interface{}, 
 		if err := os.WriteFile(dest, data, 0644); err != nil {
 			return nil, fmt.Errorf("写入共享目录失败: %w", err)
 		}
-		os.Remove(audioFile)
+		// 只删**我们合成的临时文件**：调用方给的音频文件属于它自己的资产，
+		// 删掉等于把用户的素材销毁。
+		if ttsTemp {
+			os.Remove(audioFile)
+		}
 		uri := fmt.Sprintf("file:///app/files/%s", filepath.Base(dest))
 		cqMsg := fmt.Sprintf("[CQ:record,file=%s]", uri)
 		message := interface{}(cqMsg)
@@ -2644,6 +2815,15 @@ func (p *Plugin) handleChannelOutput(args map[string]interface{}) (interface{}, 
 
 	case "image", "file", "sticker":
 		// sticker + meta.sticker_index ⇒ 从收藏表情里按序号取 URL
+		//
+		// ★ 给了 sticker_index 就**忽略 payload**（2026-10-26 现场）：
+		// 模型常把 payload 填成占位符（"[sticker]" / "sticker"），于是走到
+		// 下面的"按文件路径处理"分支 ⇒ 报 `sticker 文件不存在: [sticker]`，
+		// 用户看到的是"她发不出表情包"。
+		// 既然序号已经指明了要发哪张收藏表情，payload 里的文字就是噪声。
+		if rawType == "sticker" && stickerIndex > 0 {
+			payload = ""
+		}
 		if rawType == "sticker" && stickerIndex > 0 && payload == "" {
 			faces, ferr := p.fetchCustomFaces(int(stickerIndex))
 			if ferr != nil {
@@ -3972,7 +4152,6 @@ func (p *Plugin) downloadFromNapCat(fileID, filename string) string {
 	if p.filesDir == "" || fileID == "" {
 		return ""
 	}
-	os.MkdirAll(p.filesDir, 0755)
 	raw, err := p.napcat("get_file", map[string]interface{}{"file_id": fileID})
 	if err != nil {
 		return ""
@@ -4001,7 +4180,14 @@ func (p *Plugin) downloadFromNapCat(fileID, filename string) string {
 		data, err := base64.StdEncoding.DecodeString(info.Base64)
 		if err == nil {
 			savePath := filepath.Join(p.filesDir, sanitizeFilename(filename))
-			os.WriteFile(savePath, data, 0644)
+			// ★ 写盘失败必须返回失败（2026-10-27 现场）：此前 os.WriteFile 的
+			//   错误被丢弃，savePath 照样返回 ⇒ 上层报「文件下载完成」并注入
+			//   中断，agent 一读就是「文件不存在」（实测 qq_files 目录
+			//   因属主/权限写不进去，用户只看到"下载成功但读不到"）。
+			if werr := writeFileEnsured(savePath, data); werr != nil {
+				log.Printf("[qq] 文件写入失败 %s: %v", savePath, werr)
+				return ""
+			}
 			return savePath
 		}
 	}
@@ -4010,8 +4196,10 @@ func (p *Plugin) downloadFromNapCat(fileID, filename string) string {
 	}
 	if info.File != "" {
 		savePath := filepath.Join(p.filesDir, sanitizeFilename(filename))
-		if err := os.WriteFile(savePath, []byte(info.File), 0644); err == nil {
+		if err := writeFileEnsured(savePath, []byte(info.File)); err == nil {
 			return savePath
+		} else {
+			log.Printf("[qq] 文件写入失败 %s: %v", savePath, err)
 		}
 	}
 	return ""
@@ -4021,7 +4209,6 @@ func (p *Plugin) downloadURL(fileURL, filename string) string {
 	if p.filesDir == "" {
 		return ""
 	}
-	os.MkdirAll(p.filesDir, 0755)
 	if filename == "" {
 		filename = "file_" + filepath.Base(fileURL)
 	}
@@ -4035,8 +4222,30 @@ func (p *Plugin) downloadURL(fileURL, filename string) string {
 	if err != nil || len(data) == 0 {
 		return ""
 	}
-	os.WriteFile(savePath, data, 0644)
+	// 同上：写不进去就是下载失败，不能返回一个不存在的路径。
+	if werr := writeFileEnsured(savePath, data); werr != nil {
+		log.Printf("[qq] 文件写入失败 %s: %v", savePath, werr)
+		return ""
+	}
 	return savePath
+}
+
+// writeFileEnsured 建父目录并写文件，**返回真实错误**。
+//
+// 为什么单列一个函数：下载路径原先散落着 `os.MkdirAll(...)` 与
+// `os.WriteFile(...)` 且都不看返回值 —— 目录不可写时依然返回路径，
+// 上层就报"下载完成"。这类"假成功"比失败更难查：文件明明不存在，
+// 日志却说已完成。
+func writeFileEnsured(path string, data []byte) error {
+	if dir := filepath.Dir(path); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			return fmt.Errorf("create dir %s: %w", dir, err)
+		}
+	}
+	if err := os.WriteFile(path, data, 0644); err != nil {
+		return fmt.Errorf("write %s: %w", path, err)
+	}
+	return nil
 }
 
 func sanitizeFilename(name string) string {
@@ -4561,4 +4770,85 @@ func outputSendGroupTarget(ctx *sdk.StageContext, selfName string) string {
 		return ""
 	}
 	return strconv.FormatInt(m.GroupID, 10)
+}
+
+// turnHints 生成**本轮事实**提示（不写风格、不写人设）。
+//
+// ## 分工（用户 2026-10-26 明确）
+//
+//	人设（personal.md）  我是谁、怎么说话、黑名单、语气       —— 静态，永远成立
+//	插件注入             这一轮**才成立的事实**             —— 动态，随消息变化
+//
+// 所以这里**只**放插件独有、且本轮确定的信息：
+//
+//	· 渠道形态：QQ 私聊 / 群，回复时要用的 meta 字段
+//	· 群聊是否必须 @（group_require_at）以及对方 id
+//	· 收藏表情能不能用、怎么用（type=sticker + sticker_index，一条一张）
+//	· 本轮是合批的 N 条消息（模型据此决定是否先拉历史）
+//
+// 不放在这里的东西（都在人设里）：短句、不用 markdown、不用 emoji、
+// 不客服腔、不列清单、群聊别抢话、被冒犯怎么回。那些是"怎么说话"，
+// 不是"这一轮能做什么"；塞进插件等于把同一件事写两处。
+func (p *Plugin) turnHints(messageType string, groupID, userID int64, byChance bool) string {
+	var b strings.Builder
+
+	// ① 渠道与回复目标（模型要照抄的 meta 字段）
+	if messageType == "group" {
+		b.WriteString(fmt.Sprintf("\n【本轮渠道】QQ 群 %d → 用 output_send__qq，meta={\"group_id\":%d}", groupID, groupID))
+		if p.requireGroupAt() {
+			b.WriteString(fmt.Sprintf("；群内回复需 @ 发话人（at 目标 user_id=%d），否则对方收不到提醒", userID))
+		}
+	} else {
+		b.WriteString(fmt.Sprintf("\n【本轮渠道】QQ 私聊 → 用 output_send__qq，meta={\"user_id\":%d}", userID))
+	}
+
+	// ①.5 随机插话：这条消息**没有 @ 机器人**，是概率抽中的。
+	//
+	// 只陈述本轮成立的事实，不给风格说教：模型据此自己决定"接话还是只看"。
+	if byChance {
+		b.WriteString(fmt.Sprintf("\n【这条消息没有 @ 你】你是随机抽中(%.0f%%)参与的：可能是闲聊。"+
+			"想回应就自然地接一句，接不上就只回一个「？」或表情；不要假装对方在跟你说话，"+
+			"也不要复述你没看到的上下文", float64(p.replyChance)))
+	}
+
+	// ② 收藏表情：本轮可用的能力 + 正确用法（一条一张，不能和文字同一气泡）
+	if n := p.stickerCount(); n > 0 {
+		b.WriteString(fmt.Sprintf("；可发表情包（共 %d 个）：output_send__qq 且 type=sticker，meta 里给 sticker_index，payload 留空（不要填文字或 \"[sticker]\"）；一条消息一张，想说话请另发一条", n))
+	}
+
+	// ④ 插件配置的额外事实（运维可写，仍然只放事实，不要写风格）
+	if extra := strings.TrimSpace(getSetting[string](p.sdk.Settings(), "turn_hints", "")); extra != "" {
+		b.WriteString("\n" + extra)
+	}
+	return b.String()
+}
+
+// requireGroupAt 读"群内必须 @"的开关。
+// requireGroupAt 读"群内必须 @"的开关。
+// getSetting 的泛型只支持 string/int64/float64，故用字符串比较（配置里存的是 "true"/"false"）。
+func (p *Plugin) requireGroupAt() bool {
+	v, err := p.sdk.Settings().Get("group_require_at")
+	if err != nil || v == nil {
+		return true
+	}
+	switch val := v.(type) {
+	case bool:
+		return val
+	case string:
+		return strings.EqualFold(strings.TrimSpace(val), "true")
+	}
+	return true
+}
+
+// stickerCount 返回缓存里的收藏表情数量（0 表示这轮没法发表情）。
+func (p *Plugin) stickerCount() int {
+	raw := getSetting[string](p.sdk.Settings(), "sticker_descs", "")
+	if strings.TrimSpace(raw) == "" {
+		return 0
+	}
+	var m map[string]interface{}
+	if json.Unmarshal([]byte(raw), &m) != nil {
+		return 0
+	}
+	return len(m)
 }
