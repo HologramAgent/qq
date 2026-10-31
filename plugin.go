@@ -249,9 +249,9 @@ type Plugin struct {
 	//   · 消息 @ 了机器人 → **100%** 注入（确定性，不看概率）
 	//   · 未 @ 的群消息   → 按本概率随机注入（0=从不，100=全量）
 	// 与 group_require_at 的关系：该开关仍是总闸（false 时不做概率，全部注入）。
-	replyChance           int
-	hardPrivateTools      []string // 非所有者即使白名单也拦的工具（精确名 / 前缀*）
-	hardPrivateToolsSet   bool     // 是否显式配置过（未配置 ⇒ 用内置默认清单）
+	replyChance         int
+	hardPrivateTools    []string // 非所有者即使白名单也拦的工具（精确名 / 前缀*）
+	hardPrivateToolsSet bool     // 是否显式配置过（未配置 ⇒ 用内置默认清单）
 
 	// msg_id → peer 映射 + 会话最新状态（<7 天兜底 get_history + list_chats）
 	msgMu  sync.Mutex
@@ -1353,7 +1353,6 @@ func argInt64(args map[string]interface{}, key string) (int64, bool) {
 func argPeerID(args map[string]interface{}, key string) (int64, bool) {
 	return argInt64(args, key)
 }
-
 
 // qqAuthExtraKey 是本轮（帧）QQ 身份挂在 StageContext.Extra 上的键。
 //
