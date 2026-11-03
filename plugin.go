@@ -253,6 +253,13 @@ type Plugin struct {
 	hardPrivateTools    []string // 非所有者即使白名单也拦的工具（精确名 / 前缀*）
 	hardPrivateToolsSet bool     // 是否显式配置过（未配置 ⇒ 用内置默认清单）
 
+	// 内容审查（2026-11-03）：命中后加警示，不阻断。
+	//
+	// ★ 为什么词表由 QQ 声明而不是内核默认：哪些词敏感取决于**这一路内容**
+	//   （聊天记录 vs 网页正文 vs 文件），只有插件知道自己的工具带回什么。
+	contentSensitiveWords  []string
+	contentDetectInjection bool
+
 	// msg_id → peer 映射 + 会话最新状态（<7 天兜底 get_history + list_chats）
 	msgMu  sync.Mutex
 	msgMap map[int64]msgRef    // message_id → {peer, time}
@@ -473,6 +480,10 @@ func (p *Plugin) Start(s *sdk.PluginSDK) error {
 		Description: "true=群里只有 @ 机器人才回应（默认，避免乱插话）；false=群里所有消息都回应。群多、想让机器人自然搭话时关闭", Category: "qq"})
 	s.Settings().RegisterDef(sdk.ConfigDef{Key: "hard_private_tools", Default: defaultHardPrivateTools, Type: "string", DisplayName: "硬性私人工具限制",
 		Description: "JSON 数组：非所有者即使白名单放行也会被拦的工具，支持精确名与尾部 * 前缀（如 files_*）。清空 [] = 不做硬性拦截，完全交给白名单", Category: "qq"})
+	s.Settings().RegisterDef(sdk.ConfigDef{Key: "content_sensitive_words", Default: "", Type: "string", DisplayName: "内容审查敏感词",
+		Description: "逗号分隔。命中后会在这条**内容**前加一句警示（⚠️ 危险消息…），不阻断。作用于私聊/群聊正文（qq_get_message / qq_get_history 等取正文的工具）；留空 = 不做词表审查", Category: "qq"})
+	s.Settings().RegisterDef(sdk.ConfigDef{Key: "content_detect_injection", Default: "true", Type: "bool", DisplayName: "识别提示词注入迹象",
+		Description: "识别「忽略之前指令 / 角色劫持 / 索要系统提示 / 伪造更高优先级」这类形态，命中只加警示不阻断。群聊里任何陌生人都能发消息给模型，建议保持开启", Category: "qq"})
 	s.Settings().RegisterDef(sdk.ConfigDef{Key: "group_policy", Default: "open", Type: "string", DisplayName: "群聊策略", Description: "open / allowlist / disabled", Category: "qq", Options: []string{"open", "allowlist", "disabled"}})
 	s.Settings().RegisterDef(sdk.ConfigDef{Key: "group_allow_from", Default: "", Type: "string", DisplayName: "群聊白名单", Description: "允许接入的群号列表，逗号分隔", Category: "qq"})
 	s.Settings().RegisterDef(sdk.ConfigDef{Key: "forward_rules", Default: "[]", Type: "string", DisplayName: "转发规则", Description: "JSON 数组，每项 {group_id,host,port,password,template}。匹配的群消息通过 RCON 转发到 Minecraft。template 支持 {nickname} {message} 占位", Category: "qq"})
@@ -526,6 +537,8 @@ func (p *Plugin) Start(s *sdk.PluginSDK) error {
 	}
 	p.hardPrivateTools = parseToolAllowlist(getSetting[string](settings, "hard_private_tools", defaultHardPrivateTools))
 	p.hardPrivateToolsSet = true
+	p.contentSensitiveWords = parseWordList(getSetting[string](settings, "content_sensitive_words", ""))
+	p.contentDetectInjection = boolSetting(settings, "content_detect_injection", true)
 	p.maxQQToolCalls = nonNegativeOrDefault(int(getSetting[int64](settings, "max_qq_tool_calls", int64(defaultMaxQQToolCalls))), defaultMaxQQToolCalls)
 	p.maxQQOutputCalls = nonNegativeOrDefault(int(getSetting[int64](settings, "max_qq_output_calls", int64(defaultMaxQQOutputCalls))), defaultMaxQQOutputCalls)
 	p.maxDuplicateSend = nonNegativeOrDefault(int(getSetting[int64](settings, "max_duplicate_qq_send", int64(defaultMaxDuplicateSend))), defaultMaxDuplicateSend)
@@ -1258,6 +1271,54 @@ func parseToolAllowlist(raw string) []string {
 	for _, pattern := range patterns {
 		if pattern = strings.TrimSpace(pattern); pattern != "" {
 			out = append(out, pattern)
+		}
+	}
+	return out
+}
+
+// contentReviewTools 是**会带回他人写的正文**的工具。
+//
+// ★ 只有这些挂词表：output_send__qq 返回的是我们自己发出的回执（"ok"），
+//
+//	qq_mark_read 之类只返回状态。词表挂错工具 = 审查不到该审的、
+//	又给无害结果加噪声警示。
+var contentReviewTools = []string{
+	"qq_get_message",
+	"qq_get_history",
+	"qq_get_group_files",
+	"qq_get_group_member_info",
+	"qq_resolve_name",
+	"qq_read_document",
+}
+
+// contentToolWordMap 把配置的词表铺到每个取正文的工具上。
+//
+// 空词表返回 nil（不声明 = 内核零影响），避免给内核塞一个
+// "声明了但全空"的档位 —— 那会让人以为审查已开启。
+func (p *Plugin) contentToolWordMap() map[string][]string {
+	if len(p.contentSensitiveWords) == 0 {
+		return nil
+	}
+	out := make(map[string][]string, len(contentReviewTools))
+	for _, tool := range contentReviewTools {
+		out[tool] = p.contentSensitiveWords
+	}
+	return out
+}
+
+// parseWordList 解析逗号（或中英文逗号）分隔的词表。
+func parseWordList(raw string) []string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return nil
+	}
+	fields := strings.FieldsFunc(raw, func(r rune) bool {
+		return r == ',' || r == '，' || r == '\n' || r == ';' || r == '；'
+	})
+	out := make([]string, 0, len(fields))
+	for _, w := range fields {
+		if w = strings.TrimSpace(w); w != "" {
+			out = append(out, w)
 		}
 	}
 	return out
@@ -2012,11 +2073,20 @@ func (p *Plugin) declareSecurityProfiles(s *sdk.PluginSDK) {
 		deny = defaultHardPrivateParsed
 	}
 
+	// 内容审查策略（2026-11-03）：两个档位都带上。
+	//
+	// ★ 为什么 owner 也要带：注入/敏感词不是"权限"问题 —— 所有者自己
+	//   复制粘贴过来的外部内容、群里别人发的消息，同样可能带注入。
+	//   权限按身份收窄，内容审查按**内容**判定，两者正交。
+	//
+	// 工具级声明（ToolSensitiveWords）而不是整轮 SensitiveWords：这些工具
+	// 才带回他人写的内容；output_send__qq 之类是我们自己发出去的回执。
+	wordMap := p.contentToolWordMap()
 	if err := sec.DeclareProfiles([]sdk.SecurityProfile{
 		// 所有者：不额外限制（空 DenyTools = 本档位不收窄）。
-		{Name: securityProfileOwner},
+		{Name: securityProfileOwner, ToolSensitiveWords: wordMap, DetectInjection: p.contentDetectInjection},
 		// 访客：硬私有清单在这里由**内核**执行。
-		{Name: securityProfileGuest, DenyTools: deny},
+		{Name: securityProfileGuest, DenyTools: deny, ToolSensitiveWords: wordMap, DetectInjection: p.contentDetectInjection},
 	}); err != nil {
 		// 响亮但不断流：声明失败不该让插件起不来，但必须留痕 ——
 		// 否则权限门会静默退回"仅靠 beforeToolcall 自判"。
@@ -2025,8 +2095,9 @@ func (p *Plugin) declareSecurityProfiles(s *sdk.PluginSDK) {
 	}
 	// 成功也留痕：否则运维无法区分「声明生效」与「代码根本没跑到这里」。
 	// 这条日志是灰度期验证策略真的上线的唯一信号。
-	log.Printf("[qq] security profiles declared: %s (unrestricted), %s (deny %d patterns)",
-		securityProfileOwner, securityProfileGuest, len(deny))
+	log.Printf("[qq] security profiles declared: %s (unrestricted), %s (deny %d patterns), content review: %d words over %d tools, injection=%v",
+		securityProfileOwner, securityProfileGuest, len(deny),
+		len(p.contentSensitiveWords), len(wordMap), p.contentDetectInjection)
 }
 
 // qqInjectPayload 构造注入的 payload 扩展：告诉内核“这一轮是哪个用户引起的”。
@@ -4820,6 +4891,24 @@ func (p *Plugin) turnHints(messageType string, groupID, userID int64, byChance b
 		b.WriteString("\n" + extra)
 	}
 	return b.String()
+}
+
+// boolSetting 读布尔配置。
+//
+// getSetting 的泛型只支持 string/int64/float64，故单独走一条（与
+// requireGroupAt 同一模式：配置里可能存 bool 也可能存 "true"/"false"）。
+func boolSetting(s sdk.SettingsAPI, key string, fallback bool) bool {
+	v, err := s.Get(key)
+	if err != nil || v == nil {
+		return fallback
+	}
+	switch val := v.(type) {
+	case bool:
+		return val
+	case string:
+		return strings.EqualFold(strings.TrimSpace(val), "true")
+	}
+	return fallback
 }
 
 // requireGroupAt 读"群内必须 @"的开关。
